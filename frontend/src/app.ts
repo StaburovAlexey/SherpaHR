@@ -1,8 +1,8 @@
-import { Component, inject, signal } from '@angular/core';
+import { afterNextRender, Component, computed, ElementRef, inject, Injector, signal, viewChild } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { Api } from './api';
-import { Comment, Context, Project, Task, TaskDetail, TaskStatus } from './models';
+import { AttentionReason, AttentionTask, Comment, Context, Project, Task, TaskDetail, TaskStatus } from './models';
 
 @Component({
   selector: 'app-root',
@@ -16,7 +16,15 @@ export class AppComponent {
   projects = signal<Project[]>([]);
   project = signal<Project | null>(null);
   tasks = signal<Task[]>([]);
+  showAttention = signal(false);
+  attentionTasks = signal<AttentionTask[]>([]);
+  attentionError = signal('');
+  hasAttention = computed(() => this.projects().some(p => !p.archived && p.owner_id === this.context()?.user.id));
   detail = signal<TaskDetail | null>(null);
+  detailProject = computed(() => {
+    const task = this.detail();
+    return task ? this.projects().find(p => p.id === task.project_id) : this.project();
+  });
   loading = signal(false);
   saving = signal(false);
   error = signal('');
@@ -28,6 +36,13 @@ export class AppComponent {
   draft = this.emptyDraft();
   private generation = 0;
   private detailGeneration = 0;
+  private detailOpener: HTMLElement | null = null;
+  private readonly injector = inject(Injector);
+  private readonly detailPane = viewChild<ElementRef<HTMLElement>>('detailPane');
+  private readonly navigation = viewChild<ElementRef<HTMLElement>>('navigation');
+  readonly attentionLabels: Record<AttentionReason, string> = {
+    blocked: 'Заблокирована', overdue: 'Просрочена', unassigned: 'Без исполнителя',
+  };
   readonly statuses: { value: TaskStatus; label: string }[] = [
     { value: 'open', label: 'Открыта' }, { value: 'in_progress', label: 'В работе' },
     { value: 'blocked', label: 'Заблокирована' }, { value: 'done', label: 'Готово' },
@@ -47,6 +62,10 @@ export class AppComponent {
       if (generation !== this.generation) return;
       this.context.set(context);
       this.projects.set(projects);
+      if (this.hasAttention()) {
+        await this.selectAttention();
+        return;
+      }
       const project = projects.find(p => p.id === this.project()?.id) ?? projects[0];
       if (project) await this.selectProject(project);
     } catch (error) {
@@ -61,6 +80,8 @@ export class AppComponent {
     this.project.set(null);
     this.projects.set([]);
     this.tasks.set([]);
+    this.showAttention.set(false);
+    this.attentionTasks.set([]);
     this.context.set(null);
     this.notice.set('');
     void this.load();
@@ -71,6 +92,7 @@ export class AppComponent {
     this.loading.set(true);
     this.error.set('');
     this.notice.set('');
+    this.showAttention.set(false);
     this.project.set(project);
     this.tasks.set([]);
     this.status = '';
@@ -86,13 +108,42 @@ export class AppComponent {
     }
   }
 
+  async selectAttention(): Promise<void> {
+    this.showAttention.set(true);
+    this.project.set(null);
+    this.tasks.set([]);
+    this.attentionTasks.set([]);
+    this.notice.set('');
+    this.error.set('');
+    this.closeDetail();
+    await this.refreshAttention();
+  }
+
+  async refreshAttention(): Promise<void> {
+    const generation = ++this.generation;
+    this.loading.set(true);
+    this.attentionError.set('');
+    try {
+      const tasks = await this.api.request<AttentionTask[]>('/attention');
+      if (generation === this.generation) this.attentionTasks.set(tasks);
+    } catch (error) {
+      if (generation === this.generation) {
+        this.attentionError.set(error instanceof Error ? error.message : 'Не удалось загрузить обзор');
+      }
+    } finally {
+      if (generation === this.generation) this.loading.set(false);
+    }
+  }
+
   filteredTasks(): Task[] {
     return this.tasks().filter(task => (!this.status || task.status === this.status)
       && task.title.toLocaleLowerCase('ru').includes(this.search.toLocaleLowerCase('ru')));
   }
 
-  async openTask(task: Task): Promise<void> {
+  async openTask(task: Task, opener: HTMLElement): Promise<void> {
+    if (this.saving()) return;
     const generation = ++this.detailGeneration;
+    this.detailOpener = opener;
     this.error.set('');
     this.creating.set(false);
     this.detail.set(null);
@@ -106,28 +157,39 @@ export class AppComponent {
         assignee_id: detail.assignee_id,
         due_at: detail.due_at ? detail.due_at.slice(0, 16) : '',
       };
+      this.focusDetail();
     } catch (error) {
       if (generation === this.detailGeneration) this.fail(error);
     }
   }
 
-  closeDetail(): void {
+  closeDetail(restoreFocus = false): void {
+    const opener = this.detailOpener;
+    this.detailOpener = null;
     ++this.detailGeneration;
     this.detail.set(null);
     this.creating.set(false);
     this.comment = '';
+    if (restoreFocus) {
+      afterNextRender(() => {
+        const selectedPage = this.navigation()?.nativeElement.querySelector<HTMLElement>('[aria-current="page"]');
+        (opener?.isConnected ? opener : selectedPage)?.focus();
+      }, { injector: this.injector });
+    }
   }
 
-  createTask(): void {
+  createTask(opener: HTMLElement): void {
     this.closeDetail();
+    this.detailOpener = opener;
     this.draft = this.emptyDraft();
     this.creating.set(true);
+    this.focusDetail();
   }
 
   async saveTask(): Promise<void> {
-    const project = this.project();
-    if (!project || this.saving()) return;
-    const userId = this.api.userId;
+    const project = this.detailProject();
+    if (!project || project.archived || this.saving()) return;
+    const context = this.context();
     const generation = this.detailGeneration;
     const existing = this.detail();
     this.saving.set(true);
@@ -139,9 +201,11 @@ export class AppComponent {
         ...(existing ? { version: existing.version } : {}),
       };
       const task = await this.api.request<Task>(existing ? `/tasks/${existing.id}` : `/projects/${project.id}/tasks`, existing ? 'PATCH' : 'POST', data);
-      if (userId !== this.api.userId || this.project()?.id !== project.id) return;
+      if (context !== this.context()) return;
       if (!existing) this.projects.update(list => list.map(p => p.id === project.id ? { ...p, task_count: p.task_count + 1 } : p));
-      this.tasks.update(list => existing ? list.map(t => t.id === task.id ? task : t) : [...list, task]);
+      if (this.project()?.id === project.id) {
+        this.tasks.update(list => existing ? list.map(t => t.id === task.id ? task : t) : [...list, task]);
+      }
       if (generation === this.detailGeneration) {
         // Saving fields must not erase a comment the user has not sent yet.
         this.detail.set({ ...task, comments: existing?.comments ?? [] });
@@ -152,6 +216,7 @@ export class AppComponent {
         };
         this.notice.set('Задача сохранена');
       }
+      if (this.showAttention()) void this.refreshAttention();
     } catch (error) { if (generation === this.detailGeneration) this.fail(error); }
     finally { this.saving.set(false); }
   }
@@ -159,22 +224,29 @@ export class AppComponent {
   async addComment(): Promise<void> {
     const task = this.detail();
     if (!task || this.saving()) return;
+    const context = this.context();
     const generation = this.detailGeneration;
     this.saving.set(true);
     this.error.set('');
     try {
       const comment = await this.api.request<Comment>(`/tasks/${task.id}/comments`, 'POST', { body: this.comment });
-      if (generation !== this.detailGeneration) return;
-      // Refresh only the discussion: fields may contain unsaved user edits.
-      this.detail.update(current => current ? { ...current, comments: [...current.comments, comment] } : current);
-      this.comment = '';
-      this.notice.set('Комментарий добавлен');
+      if (context !== this.context()) return;
+      if (generation === this.detailGeneration) {
+        // Update the discussion without overwriting unsaved task fields.
+        this.detail.update(current => current ? { ...current, comments: [...current.comments, comment] } : current);
+        this.comment = '';
+        this.notice.set('Комментарий добавлен');
+      }
+      if (this.showAttention()) void this.refreshAttention();
     } catch (error) { if (generation === this.detailGeneration) this.fail(error); }
     finally { this.saving.set(false); }
   }
 
   statusLabel(status: string): string { return this.statuses.find(s => s.value === status)?.label ?? status; }
   userName(id: number | null): string { return this.context()?.users.find(u => u.id === id)?.name ?? 'Не назначен'; }
+  private focusDetail(): void {
+    afterNextRender(() => this.detailPane()?.nativeElement.focus(), { injector: this.injector });
+  }
   private fail(error: unknown): void { this.error.set(error instanceof Error ? error.message : 'Не удалось выполнить запрос'); }
   private emptyDraft(): { title: string; description: string; status: TaskStatus; assignee_id: number | null; due_at: string } {
     return { title: '', description: '', status: 'open', assignee_id: null, due_at: '' };
