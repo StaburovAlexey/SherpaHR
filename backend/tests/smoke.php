@@ -17,7 +17,8 @@ fclose($socket);
 $base = 'http://' . $address;
 $environment = getenv();
 $environment['DB_PATH'] = $directory . '/test.sqlite';
-$environment['SEED_NOW'] = '2026-11-11T08:00:00Z';
+$seedTime = time();
+$environment['SEED_NOW'] = gmdate('Y-m-d\TH:i:s\Z', $seedTime);
 $process = proc_open([PHP_BINARY, '-S', $address, __DIR__ . '/../router.php'],
     [0 => ['pipe', 'r'], 1 => ['file', $directory . '/server.log', 'a'], 2 => ['file', $directory . '/server.log', 'a']],
     $pipes, dirname(__DIR__, 2), $environment);
@@ -65,7 +66,7 @@ try {
     check($ready, 'server starts with fresh SQLite');
     [$status, $response] = request('GET', '/api/context');
     check($status === 200 && $response['data']['user']['id'] === 1, 'default persona is Anna');
-    check($response['data']['seeded_at'] === '2026-11-11T08:00:00Z', 'seed clock can be reproduced');
+    check($response['data']['seeded_at'] === $environment['SEED_NOW'], 'seed clock can be reproduced');
     [$status, $response] = request('GET', '/api/projects');
     check($status === 200 && array_column($response['data'], 'id') === [1, 2, 3, 4], 'Anna sees only her projects');
     check($response['data'][3]['archived'] === true, 'archive marker is boolean');
@@ -81,7 +82,7 @@ try {
     check(request('POST', '/api/projects/5/tasks', ['title' => 'Forbidden'])[0] === 404, 'hidden project cannot receive tasks');
     [$status, $response] = request('GET', '/api/tasks/1');
     check($status === 200 && count($response['data']['comments']) === 2, 'task detail includes discussion');
-    check($response['data']['due_at'] === '2026-11-12T08:00:00Z', 'deadline relative to initial seed');
+    check($response['data']['due_at'] === gmdate('Y-m-d\TH:i:s\Z', $seedTime + 86400), 'deadline relative to initial seed');
     check(request('POST', '/api/projects/4/tasks', ['title' => 'No'])[0] === 409, 'archive rejects task creation');
     check(request('PATCH', '/api/tasks/10', ['title' => 'No', 'version' => 1])[0] === 409, 'archive rejects task edits');
     check(request('POST', '/api/tasks/10/comments', ['body' => 'No'])[0] === 409, 'archive rejects comments');
@@ -113,6 +114,29 @@ try {
     check(count($response['data']) === 6, 'initialization does not duplicate or reset data');
     check(request('GET', '/api/tasks/9999')[0] === 404, 'missing task returns 404');
     check(request('GET', '/api/unknown')[0] === 404, 'unknown route returns 404');
+
+    [$status, $response] = request('GET', '/api/attention');
+    check($status === 200 && array_column($response['data'], 'id') === [5, 1, 2, 7], 'Anna sees ranked tasks across her active projects');
+    $attention = array_column($response['data'], null, 'id');
+    check($attention[5]['reasons'] === ['blocked', 'overdue'] && $attention[1]['reasons'] === ['blocked']
+        && $attention[2]['reasons'] === ['overdue'] && $attention[7]['reasons'] === ['unassigned'], 'attention lists each matching reason');
+    check($attention[7]['project_id'] === 2 && $attention[7]['latest_comment']['author'] === 'Борис · разработчик'
+        && str_contains($attention[7]['latest_comment']['body'], 'Анна'), 'attention includes discussion context from the right project');
+    check(request('GET', '/api/attention', null, 2) === [200, ['data' => []]], 'members do not see an overview of projects they do not lead');
+    [$status, $response] = request('GET', '/api/attention', null, 3);
+    check($status === 200 && array_column($response['data'], 'id') === [11], 'Vera sees only the project she leads');
+    [$status, $response] = request('GET', '/api/projects/2/tasks');
+    check($status === 200 && array_column($response['data'], 'id') === [5, 6, 7], 'project list includes tasks without an assignee');
+
+    [$status, $response] = request('POST', '/api/tasks/7/comments', ['body' => '  Беру на себя согласование.  ']);
+    check($status === 201 && $response['data']['user_id'] === 1 && $response['data']['body'] === 'Беру на себя согласование.', 'comment trims the text and uses the current user');
+    $comment = $response['data'];
+    [$status, $response] = request('GET', '/api/attention');
+    $attention = array_column($response['data'], null, 'id');
+    check($status === 200 && $attention[7]['latest_comment'] === $comment, 'overview shows the newest comment');
+    check(request('PATCH', '/api/tasks/7', ['status' => 'done', 'version' => 1])[0] === 200, 'commenting preserves the version for task edits');
+    [$status, $response] = request('GET', '/api/attention');
+    check($status === 200 && array_column($response['data'], 'id') === [5, 1, 2], 'completed task leaves the overview');
     echo "PASS: $count API checks\n";
 } catch (Throwable $error) {
     fwrite(STDERR, $error->getMessage() . PHP_EOL . file_get_contents($directory . '/server.log'));
